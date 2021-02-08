@@ -1,7 +1,6 @@
-import net, asyncnet, asyncdispatch, asyncfile,
-       uri, mimetypes, strutils, strtabs,
-       os, osproc,
-       openssl, md5
+import tls, net, asyncdispatch, asyncfile,
+       uri, mimetypes, strutils, strtabs, md5,
+       os, osproc
 
 import config
 
@@ -14,6 +13,9 @@ const
   StatusNotFound = 51
   StatusProxyRefused = 53
   StatusMalformedRequest = 59
+  StatusCertRequired = 60
+  StatusCertUnauth = 61
+  StatusCertInvalid = 62
   
 type VHost = tuple
   hostname, rootDir: string
@@ -29,11 +31,6 @@ var certMD5: string
 var m = newMimeTypes()
 m.register(ext = "gemini", mimetype = "text/gemini")
 m.register(ext = "gmi", mimetype = "text/gemini")
-
-proc SSL_CTX_set_session_id_context(ctx: SslCtx, id: string, idLen: int) {.importc, dynlib: DLLSSLName}
-
-proc sslSetSessionIdContext(ctx: SslContext, id: string = "") =
-  SSL_CTX_set_session_id_context(ctx.context, id, id.len)
 
 proc isVirtDir(path, virtDir: string): bool =
   virtDir.len > 0 and
@@ -53,12 +50,12 @@ proc readAsyncFile(path: string): Future[string] {.async.} =
   defer: file.close()
   return await file.readAll()
 
-proc serveScript(res: Uri, vhost: VHost): Future[Response] {.async.} =
+proc serveScript(res: Uri, vhost: VHost, clientCert: string): Future[Response] {.async.} =
   let
     query = res.query
     script = res.path.extractFilename
     scriptFile = settings.cgi.dir / script
-
+  
   if not fileExists(scriptFile):
     return Response(code: StatusNotFound, meta: "CGI SCRIPT " & script & " NOT FOUND.")
   
@@ -71,6 +68,7 @@ proc serveScript(res: Uri, vhost: VHost): Future[Response] {.async.} =
   putEnv("SERVER_NAME", vhost.hostname)
   putEnv("SERVER_PORT", $settings.port)
   putEnv("QUERY_STRING", query)
+  putEnv("REMOTE_IDENT", clientCert.getMD5())
   
   let (body, outp) = execCmdEx(scriptFile)
   
@@ -118,7 +116,13 @@ proc serveDir(path, resPath: string): Future[Response] {.async.} =
     of pcLinkToFile, pcLinkToDir: result.body.add " [SYMLINK]"
     result.body.add "\n"
 
-proc parseRequest(line: string): Future[Response] {.async.} =
+proc authorisedCert(clientCert, file: string): Future[bool] {.async.} =
+  if file.len > 0:
+    return clientCert in parsePEM(await readAsyncFile(settings.certsDir / file))
+    
+  return
+
+proc parseRequest(line, clientCert: string): Future[Response] {.async.} =
   let res = parseUri(line)
   
   if not res.isAbsolute:
@@ -126,14 +130,27 @@ proc parseRequest(line: string): Future[Response] {.async.} =
   
   if settings.redirects.hasKey(res.hostname):
     return Response(code: StatusRedirect, meta: settings.redirects[res.hostname])
+  
+  if settings.vhosts.hasKey(res.hostname):
+    let
+      vhost = (hostname: res.hostname,
+               rootDir: settings.vhosts[res.hostname])
+      hostpath = res.hostname / res.path
     
-  elif settings.vhosts.hasKey(res.hostname):
-    let vhost = (hostname: res.hostname,
-                 rootDir: settings.vhosts[res.hostname])
+    for key, val in settings.authZones.pairs:
+      if hostpath.startsWith(key):
+        if clientCert.len < 1:
+          return Response(code: StatusCertRequired, meta: "CERTIFICATE REQUIRED")
+
+        if not await clientCert.authorisedCert(val):
+          return Response(code: StatusCertUnauth, meta: "CERTIFICATE NOT AUTHORISED")
+
+      break
+
     var
       rootDir = vhost.rootDir
       filePath = rootDir / res.path
-      
+
     if res.path.startsWith("/~"):
       let (user, newPath) = res.path.getUserDir
       rootDir = settings.homeDir % [user] / vhost.hostname
@@ -145,7 +162,7 @@ proc parseRequest(line: string): Future[Response] {.async.} =
       resPath = "/"
     
     if res.path.isVirtDir(settings.cgi.virtDir):
-      return await serveScript(res, vhost)
+      return await serveScript(res, vhost, clientCert)
     elif fileExists(filePath):
       return await serveFile(filePath)
     elif dirExists(filePath):
@@ -161,37 +178,43 @@ proc handle(client: AsyncSocket) {.async.} =
   if line.len > 0:
     echo line
     try:
-      let resp = await parseRequest(line)
+      let
+        cert = client.getPeerCertificate()
+        resp = await parseRequest(line, cert.getX509Cert())
+      
       await client.send($resp.code & ' ' & resp.meta & "\r\n")
+      
       if resp.code == StatusSuccess:
         await client.send(resp.body)
+
+    except SSLError:
+      await client.send("62 CERT INVALID OR HAS EXPIRED\r\n")
+    
     except:
-      await client.send("40 INTERNAL ERROR\r\n")
       echo getCurrentExceptionMsg()
-      
-  client.close()
+      await client.send("40 INTERNAL ERROR\r\n")
 
 proc serve() {.async.} =
   let ctx = newContext(certFile = settings.certFile,
                        keyFile = settings.keyFile)
-
+  ctx.context.SSL_CTX_set_verify(SslVerifyPeer, verify_cb)
   var server = newAsyncSocket()
   server.setSockOpt(OptReuseAddr, true)
   server.setSockOpt(OptReusePort, true)
   server.bindAddr(Port(settings.port))
   server.listen()
   ctx.wrapSocket(server)
-  ctx.sslSetSessionIdContext(id = certMD5)
-  
-  var client: AsyncSocket
+  ctx.sslSetSessionIdContext(certMD5)
+
   while true:
+    let client = await server.accept()
     try:
-      client = await server.accept()
       ctx.wrapConnectedSocket(client, handshakeAsServer)
       await client.handle()
-      client.close()
     except:
       echo getCurrentExceptionMsg()
+    finally:
+      client.close()
 
 if paramCount() != 1:
   echo "USAGE:"
